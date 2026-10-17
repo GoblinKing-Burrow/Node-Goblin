@@ -1,0 +1,22 @@
+[Unit]
+Description=Burrow Node Goblin (outbound controller client)
+Documentation=https://github.com/GoblinKing-Burrow/Node-Goblin
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=burrow
+Group=burrow
+Environment=BURROW_GATEWAY_STATE_DIR=/var/lib/burrow-host-gateway
+EnvironmentFile=-/etc/burrow-host-gateway/gateway.env
+WorkingDirectory=/opt/burrow-host-gateway
+ExecStart=/usr/bin/env node /opt/burrow-host-gateway/cli.mjs
+Restart=always
+RestartSec=5s
+UMask=0077
+PrivateTmp=yes
+ReadWritePaths=/var/lib/burrow-host-gateway
+
+[Install]
+WantedBy=multi-user.target

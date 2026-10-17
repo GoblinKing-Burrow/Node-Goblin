@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+import fs from 'node:fs';
+import process from 'node:process';
+import { GatewayDaemon } from './lib/daemon.mjs';
+import { OperationJournal } from './lib/journal.mjs';
+import { OutboundGatewayTransport, writePairingCode } from './lib/network-transport.mjs';
+
+function fileFromEnv(name) {
+  return process.env[name] ? fs.readFileSync(process.env[name]) : undefined;
+}
+
+let service;
+let confirmationTimer;
+if (process.env.BURROW_GATEWAY_CONTROLLER_URL) {
+  const controller = new URL(process.env.BURROW_GATEWAY_CONTROLLER_URL);
+  if (controller.protocol !== 'tls:') throw new Error('controller URL must use tls:');
+  const stateDir = process.env.BURROW_GATEWAY_STATE_DIR;
+  if (!stateDir) throw new Error('BURROW_GATEWAY_STATE_DIR is required for Node Goblin network transport');
+  if (!process.env.BURROW_GATEWAY_ID?.trim()) throw new Error('BURROW_GATEWAY_ID is required for Node Goblin network transport');
+  const daemon = new GatewayDaemon({
+    journal: new OperationJournal({ stateDir }),
+    identity: { transport: 'tls-jsonl-outbound' },
+  });
+  service = new OutboundGatewayTransport({
+    host: controller.hostname,
+    port: Number(controller.port || 443),
+    gatewayId: process.env.BURROW_GATEWAY_ID,
+    stateDir,
+    enrollmentToken: process.env.BURROW_GATEWAY_ENROLLMENT_TOKEN,
+    ca: fileFromEnv('BURROW_GATEWAY_CA_FILE'),
+    cert: fileFromEnv('BURROW_GATEWAY_CERT_FILE'),
+    key: fileFromEnv('BURROW_GATEWAY_KEY_FILE'),
+    daemon,
+  }).start();
+  service.on('pairingPending', ({ gatewayId, pairingCode }) => {
+    const message = `Node Goblin pairing pending for ${gatewayId}; pairing code: ${pairingCode}`;
+    console.error(message);
+    if (!confirmationTimer) confirmationTimer = setInterval(() => {
+      const file = `${stateDir}/pairing-confirmation.json`;
+      try {
+        const confirmation = JSON.parse(fs.readFileSync(file, 'utf8'));
+        fs.rmSync(file, { force: true });
+        service.confirmControllerPairing(confirmation.pairingCode);
+      } catch {}
+    }, 250);
+    try { writePairingCode(stateDir, { gatewayId, pairingCode }); } catch {}
+  });
+} else {
+  service = new GatewayDaemon();
+  service.start();
+}
+
+const shutdown = () => {
+  clearInterval(confirmationTimer);
+  service.stopping = true;
+  const daemon = service.daemon || service;
+  for (const entry of daemon.controllers.values()) entry.controller.abort();
+  service.stop();
+};
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

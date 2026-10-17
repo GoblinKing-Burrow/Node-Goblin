@@ -1,0 +1,180 @@
+#!/bin/sh
+# Operator interface for the systemd Node Goblin package.
+set -eu
+ROOT=${BURROW_GATEWAY_ROOT:-/}
+SYSTEMCTL_OVERRIDE=${SYSTEMCTL:-}
+SYSTEMCTL=${SYSTEMCTL:-systemctl}
+SERVICE=burrow-host-gateway.service
+usage() {
+  cat >&2 <<'EOF'
+usage: node-goblin configure [CONTROLLER_ADDRESS NODE_ID]
+       node-goblin connect
+       node-goblin apply --restart
+       node-goblin unpair
+       node-goblin status
+       node-goblin confirm-pairing CODE
+       node-goblin pairing-code
+       node-goblin uninstall
+
+configure prompts for omitted, non-secret values. Existing enrollment and TLS
+settings are preserved. Put secrets in the protected configuration file, never
+in command arguments. unpair removes only controller trust so this node can be
+paired with a fresh controller; its node identity and operation journal remain.
+EOF
+}
+path() { printf '%s%s\n' "${ROOT%/}" "$1"; }
+need_root() { [ "$ROOT" != / ] || [ "$(id -u)" -eq 0 ] || { echo "node-goblin $1 must run as root" >&2; exit 1; }; }
+config=$(path /etc/burrow-host-gateway/gateway.env)
+helper=$(path /opt/burrow-host-gateway/deploy/service-common.sh)
+[ -r "$helper" ] || helper="$(dirname "$0")/service-common.sh"
+. "$helper"
+service_available() { [ "$ROOT" = / ] || [ -n "${SYSTEMCTL_OVERRIDE:-}" ]; }
+
+
+command=${1:-}; [ "$#" -eq 0 ] || shift
+case "$command" in
+  configure)
+    need_root configure
+    controller=${1:-}; node_id=${2:-}; [ "$#" -le 2 ] || { usage; exit 2; }
+    if [ -z "$controller" ]; then printf 'Controller address (host:port or tls://host:port): ' >&2; IFS= read -r controller; fi
+    if [ -z "$node_id" ]; then printf 'Node ID: ' >&2; IFS= read -r node_id; fi
+    case "$controller" in tls://*) ;; *://*) echo "controller address must use tls://" >&2; exit 2;; *:*) controller="tls://$controller";; *) echo "controller address must include a port" >&2; exit 2;; esac
+    case "$controller" in *[!A-Za-z0-9._:/\[\]-]*) echo "controller address contains unsupported characters" >&2; exit 2;; esac
+    case "$node_id" in ""|*[!A-Za-z0-9._-]*) echo "node ID may contain only letters, digits, dot, underscore, and hyphen" >&2; exit 2;; esac
+    mkdir -p "$(dirname "$config")"
+    tmp="$config.new.$$"; trap 'rm -f "$tmp"' EXIT HUP INT TERM
+    if [ -f "$config" ]; then
+      awk '!/^BURROW_GATEWAY_CONTROLLER_URL=/ && !/^BURROW_GATEWAY_ID=/' "$config" >"$tmp"
+    else : >"$tmp"; fi
+    printf 'BURROW_GATEWAY_CONTROLLER_URL=%s\nBURROW_GATEWAY_ID=%s\n' "$controller" "$node_id" >>"$tmp"
+    chmod 0640 "$tmp"
+    if [ "$ROOT" = / ] && getent group burrow >/dev/null 2>&1; then chown root:burrow "$tmp"; fi
+    mv "$tmp" "$config"; trap - EXIT HUP INT TERM
+    echo "Configured Node Goblin $node_id for $controller in $config."
+    echo "Settings saved, not applied to an already-running daemon."
+    echo "For initial start use 'sudo node-goblin connect'. After draining active work, use 'sudo node-goblin apply --restart'."
+    ;;
+  connect|apply)
+    if [ "$command" = apply ]; then
+      [ "$#" -eq 1 ] && [ "$1" = --restart ] || { echo "Drain active work, then use: node-goblin apply --restart" >&2; exit 2; }
+    else [ "$#" -eq 0 ] || { usage; exit 2; }; fi
+    need_root "$command"
+    service_available || { echo "connect is unavailable under a staging root" >&2; exit 1; }
+    [ -r "$config" ] || { echo "missing configuration; run 'sudo node-goblin configure' first" >&2; exit 1; }
+    grep -q '^BURROW_GATEWAY_CONTROLLER_URL=tls://.' "$config" || { echo "controller is not configured" >&2; exit 1; }
+    grep -q '^BURROW_GATEWAY_ID=.' "$config" || { echo "node ID is not configured" >&2; exit 1; }
+    command -v "$SYSTEMCTL" >/dev/null 2>&1 || { echo "systemctl is required" >&2; exit 1; }
+    "$SYSTEMCTL" daemon-reload
+    if [ "$command" = apply ]; then
+      "$SYSTEMCTL" enable "$SERVICE"
+      "$SYSTEMCTL" restart "$SERVICE"
+    else
+      "$SYSTEMCTL" enable --now "$SERVICE"
+      echo "Connect does not restart an active daemon; saved changes require apply --restart after draining work."
+    fi
+    "$SYSTEMCTL" is-active --quiet "$SERVICE" || { "$SYSTEMCTL" status --no-pager "$SERVICE" >&2 || true; echo "Node Goblin did not become active" >&2; exit 1; }
+    echo "Node Goblin is active. On first connection, compare its pairing code with the controller."
+    pairing_code="$(path /var/lib/burrow-host-gateway)/pairing-code.json"
+    if [ -r "$pairing_code" ]; then
+      node - "$pairing_code" <<'NODE'
+const fs = require('node:fs');
+const file = process.argv[2];
+try {
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (value?.gatewayId && value?.pairingCode) console.log(`Pairing code for ${value.gatewayId}: ${value.pairingCode}`);
+} catch {}
+NODE
+    fi
+    ;;
+  unpair)
+    [ "$#" -eq 0 ] || { usage; exit 2; }; need_root unpair
+    state=$(path /var/lib/burrow-host-gateway)
+    if service_available; then stop_and_verify; fi
+    identity="$state/node-identity.json"
+    if [ -f "$identity" ]; then
+      node - "$identity" <<'NODE'
+const fs = require('node:fs');
+const file = process.argv[2];
+const identity = JSON.parse(fs.readFileSync(file, 'utf8'));
+delete identity.controllerPublicKey;
+delete identity.controllerTlsFingerprint;
+const temporary = `${file}.${process.pid}.tmp`;
+fs.writeFileSync(temporary, `${JSON.stringify(identity)}\n`, { mode: 0o600, flag: 'wx' });
+fs.renameSync(temporary, file);
+fs.chmodSync(file, 0o600);
+NODE
+    fi
+    rm -f "$state/controller-trust.json"
+    # Consume any bootstrap token permanently after an explicit unpair. A later
+    # start must use the normal pairing flow rather than silently re-enrolling.
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$state/controller-enrollment-consumed"
+    rm -f "$state/pairing-code.json" "$state/pairing-confirmation.json"
+    # unpair runs as root but the daemon runs as burrow; retain its exclusive
+    # read/write access to the preserved node identity after rewriting it.
+    if [ "$ROOT" = / ] && getent passwd burrow >/dev/null 2>&1; then
+      chown burrow:burrow "$identity" 2>/dev/null || true
+    fi
+    echo "Removed controller trust. Run 'sudo node-goblin connect' to pair with the configured controller."
+    ;;
+  confirm-pairing)
+    [ "$#" -eq 1 ] || { usage; exit 2; }; need_root confirm-pairing
+    state="$(path /var/lib/burrow-host-gateway)"
+    python3 - "$state" "$1" <<'PYCONFIRM'
+import json, os, sys
+state, code = sys.argv[1:]
+with open(os.path.join(state, 'pairing-code.json')) as f:
+    pending = json.load(f)
+if pending['pairingCode'] != code:
+    raise SystemExit('pairing code mismatch')
+file = os.path.join(state, 'pairing-confirmation.json')
+with open(file, 'w') as f:
+    os.chmod(file, 0o600)
+    json.dump({'pairingCode': code}, f)
+    os.chown(file, os.stat(os.path.join(state, 'pairing-code.json')).st_uid, -1)
+PYCONFIRM
+    ;;
+  pairing-code)
+    [ "$#" -eq 0 ] || { usage; exit 2; }
+    state=$(path /var/lib/burrow-host-gateway)
+    pairing_code="$state/pairing-code.json"
+    [ -r "$pairing_code" ] || { echo "No pairing code is currently pending." >&2; exit 1; }
+    node - "$pairing_code" <<'NODE'
+const fs = require('node:fs');
+const file = process.argv[2];
+try {
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (!value?.gatewayId || !value?.pairingCode) process.exit(1);
+  console.log(`Pairing pending for ${value.gatewayId}`);
+  console.log(`Pairing code: ${value.pairingCode}`);
+} catch { process.exit(1); }
+NODE
+    ;;
+  status)
+    [ "$#" -eq 0 ] || { usage; exit 2; }
+    [ "$ROOT" = / ] || { echo "status is unavailable under a staging root" >&2; exit 1; }
+    state=$(path /var/lib/burrow-host-gateway)
+    "$SYSTEMCTL" status --no-pager "$SERVICE"
+    pairing_code="$state/pairing-code.json"
+    if [ -r "$pairing_code" ]; then
+      node - "$pairing_code" <<'NODE'
+const fs = require('node:fs');
+const file = process.argv[2];
+try {
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (value?.gatewayId && value?.pairingCode) {
+    console.log(`Pairing pending for ${value.gatewayId}`);
+    console.log(`Pairing code: ${value.pairingCode}`);
+  }
+} catch {}
+NODE
+    fi
+    ;;
+  uninstall)
+    [ "$#" -eq 0 ] || { usage; exit 2; }; need_root uninstall
+    uninstaller=$(path /opt/burrow-host-gateway/deploy/uninstall.sh)
+    [ -x "$uninstaller" ] || { echo "installed uninstaller is missing" >&2; exit 1; }
+    exec "$uninstaller"
+    ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac
