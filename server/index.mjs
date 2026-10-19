@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { controllerIdentity } from '../gateway/index.mjs';
-import { GatewayControllerListener, canonicalize } from '../gateway/index.mjs';
+import { GatewayControllerListener, canonicalize, canonicalProcessRequest, normalizeTraceContext } from '../gateway/index.mjs';
 
 const SETTINGS_NAME = 'targets';
 const CONTROLLER_SETTINGS_NAME = 'controller';
@@ -14,6 +14,9 @@ const PENDING_PAIRINGS_NAME = 'pendingNodeGoblinPairings';
 const TLS_METADATA_NAME = 'controllerTlsMetadata';
 const TARGET_ID = /^[a-z0-9][a-z0-9._-]*$/i;
 const OPERATION_ID = /^[a-z0-9][a-z0-9._:-]{0,255}$/i;
+function cleanTraceContext(value) {
+  try { return normalizeTraceContext(value); } catch { throw problem('trace_context_invalid'); }
+}
 
 function problem(message, statusCode = 400) {
   const error = new Error(message);
@@ -206,7 +209,9 @@ export function createOperationCorrelationStore(settings, { terminalLimit = 256 
   return Object.freeze({
     begin(request, kind, payload) {
       return transact(async () => {
-        const digest = requestDigest(payload);
+        const semanticPayload = payload && typeof payload === 'object' && !Array.isArray(payload)
+          ? canonicalProcessRequest(payload, kind === 'filesystem' ? 'filesystem.execute' : 'process.exec').params : payload;
+        const digest = requestDigest(semanticPayload);
         const records = await read();
         const existing = records.find((entry) => entry.operationId === request.operationId);
         if (existing && (existing.requestDigest !== digest || existing.targetId !== request.targetId || existing.kind !== kind)) {
@@ -290,7 +295,7 @@ export function createProcessController(service, { logger = console, operationSt
       let process;
       try { process = cleanProcessRequest(request.process); }
       catch (error) { throw new Error(error.message); }
-      const params = { operationId, ...process };
+      const params = { operationId, ...process, ...(request.traceContext ? { traceContext: cleanTraceContext(request.traceContext) } : {}) };
       if (request.process.cwd) params.cwd = String(request.process.cwd);
       if (request.process.env) params.env = { ...request.process.env };
       if (request.process.timeoutMs != null) params.timeoutMs = Number(request.process.timeoutMs);
@@ -329,7 +334,7 @@ export function createProcessController(service, { logger = console, operationSt
       const gatewayId = targetId;
       if (!OPERATION_ID.test(operationId)) throw new Error('operation_id_invalid');
       if (!targetId) throw new Error('target_id_required');
-      const params = { operationId, parentRunId: request.parentRunId, toolCallId: request.toolCallId, tool: request.operation?.tool, arguments: { ...(request.operation?.arguments || {}) } };
+      const params = { operationId, parentRunId: request.parentRunId, toolCallId: request.toolCallId, tool: request.operation?.tool, arguments: { ...(request.operation?.arguments || {}) }, ...(request.traceContext ? { traceContext: cleanTraceContext(request.traceContext) } : {}) };
       let cancelPromise = null;
       const cancel = () => { if (!cancelPromise) cancelPromise = Promise.resolve(service.dispatchCancel(gatewayId, operationId)).catch((error) => logger.warn?.('Node Goblin cancellation dispatch failed: cancellation_dispatch_failed')); };
       abortSignal?.throwIfAborted();
@@ -377,6 +382,7 @@ export async function createControllerService({ settings, secrets, listenerFacto
   const tlsConfigured = { key: Boolean(key), cert: Boolean(cert), ca: Boolean(ca) };
   let listener = null;
   let listening = false;
+  let telemetryConfiguration = { enabled: false, endpoint: '' };
   if (config.enabled && !startError) {
     if (!key || !cert) startError = 'controller_tls_credentials_missing';
     else {
@@ -416,6 +422,11 @@ export async function createControllerService({ settings, secrets, listenerFacto
     await settings.set('controllerTrustMutations', [...ids]);
   };
 
+  if (listener?.on) listener.on('gatewayAuthenticated', ({ gatewayId, connection }) => {
+    if (!connection || connection.state !== 'ready') return;
+    void listener.dispatchTelemetryConfiguration(gatewayId, telemetryConfiguration)
+      .catch(() => logger.warn?.('Node Goblin telemetry configuration failed: telemetry_configuration_failed'));
+  });
   if (listener?.on) listener.on('gatewayPairingPending', (pairing) => {
     const token = generation(pairing.gatewayId);
     void transact(async () => {
@@ -510,6 +521,11 @@ export async function createControllerService({ settings, secrets, listenerFacto
       if (!listening) throw Object.assign(new Error(startError || 'controller_not_running'), { code: startError || 'controller_not_running' });
       return redact(await listener.dispatchCancel(gatewayId, operationId), secretValues);
     },
+    async configureTelemetry(configuration) {
+      telemetryConfiguration = { ...configuration };
+      if (!listening) return { configured: 0, succeeded: 0, failed: 0, controllerRunning: false };
+      return listener.configureTelemetry(telemetryConfiguration);
+    },
     revokeGateway(gatewayId) {
       invalidate(gatewayId);
       return transact(async () => {
@@ -530,7 +546,10 @@ export async function createControllerService({ settings, secrets, listenerFacto
 export async function activate({ api, settings, secrets, logger, processExecution, controllerService, listenerFactory } = {}) {
   const service = controllerService ?? await createControllerService({ settings, secrets, listenerFactory, logger });
   const operationStore = createOperationCorrelationStore(settings);
-  const unregisterController = processExecution?.registerController?.(createProcessController(service, { logger, operationStore }));
+  const unregisterController = processExecution?.registerController ? processExecution.registerController(Object.freeze({
+    ...createProcessController(service, { logger, operationStore }),
+    configureTelemetry: configuration => service.configureTelemetry(configuration),
+  })) : null;
   api.get('/targets', async () => ({ ok: true, targets: await storedTargets(settings) }));
   api.post('/targets', async ({ body = {} }) => {
     const targets = await storedTargets(settings); const target = cleanTarget(body);
@@ -596,7 +615,9 @@ export async function activate({ api, settings, secrets, logger, processExecutio
     const operationId = String(body.operationId ?? '').trim();
     if (!OPERATION_ID.test(operationId)) throw problem('operation_id_invalid');
     const process = cleanProcessRequest(body);
-    try { return { ok: true, operationId, dispatch: await service.dispatchProcessExec(params.gatewayId, { ...body, ...process, operationId }) }; }
+    const traceContext = cleanTraceContext(body.traceContext);
+    const dispatchBody = { ...body, ...process, operationId, ...(traceContext ? { traceContext } : {}) };
+    try { return { ok: true, operationId, dispatch: await service.dispatchProcessExec(params.gatewayId, dispatchBody) }; }
     catch (error) { throw serviceError(error); }
   });
   api.post('/gateways/:gatewayId/operations/:operationId/cancel', async ({ params }) => {

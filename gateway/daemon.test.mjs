@@ -31,6 +31,16 @@ async function collect(run, options = {}) {
   return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
 
+test('controller can configure telemetry through the authenticated daemon protocol', async () => {
+  let configured;
+  const telemetry = { async configure(value) { configured = value; return { configured: true, source: 'controller' }; }, async execute({ operation }) { return operation(); }, async shutdown() {} };
+  const messages = await collect(async ({ input }) => {
+    input.write(JSON.stringify({ id: 'telemetry', method: 'telemetry.configure', params: { enabled: true, endpoint: 'https://collector.example', headers: 'x-token=private' } }) + '\n');
+  }, { telemetry, waitMs: 50 });
+  assert.deepEqual(configured, { enabled: true, endpoint: 'https://collector.example', headers: 'x-token=private' });
+  assert.deepEqual(messages[0].result, { configured: true, source: 'controller' });
+});
+
 test('hello and health respond with identity and status', async () => {
   const messages = await collect(async ({ input }) => {
     input.write(JSON.stringify({ id: '1', method: 'hello' }) + '\n');
@@ -270,4 +280,34 @@ test('journal persists only mutations, once per put, retaining replay and confli
   journal.put('three', 'digest3', {}, 3); assert.equal(writes, 3);
   assert.equal(journal.inspect('one', 4), null); assert.equal(writes, 3);
   assert.equal(journal.inspect('two', 12), null); assert.equal(writes, 4);
+});
+
+
+test('daemon rejects invalid trace context before accepting work and never passes it to runners', async () => {
+  const invalid = await collect(async ({ input }) => {
+    input.write(JSON.stringify({ id: 'bad-trace', method: 'filesystem.execute', params: { operationId: 'bad-trace-op', tool: 'files_inspect', arguments: { path: '/tmp' }, traceContext: { traceparent: 'invalid' } } }) + '\n');
+  }, { waitMs: 30 });
+  assert.equal(invalid[0].error.code, 'trace_context_invalid');
+  assert.equal(invalid.some((message) => message.type === 'accepted'), false);
+
+  let executedParams;
+  const telemetry = { async execute(input) { executedParams = input; return input.operation(); }, async shutdown() {} };
+  const messages = await collect(async ({ input }) => {
+    input.write(JSON.stringify({ id: 'good-trace', method: 'filesystem.execute', params: { operationId: 'good-trace-op', tool: 'files_inspect', arguments: { path: '/tmp' }, traceContext: { traceparent: '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01' } } }) + '\n');
+  }, { telemetry, waitMs: 40 });
+  assert.equal(messages.some((message) => message.type === 'accepted'), true);
+  assert.equal(executedParams.traceContext.traceparent.endsWith('-01'), true);
+  assert.equal(Object.hasOwn(executedParams, 'operation'), true);
+});
+
+test('daemon telemetry shutdown is awaited', async () => {
+  let released; let done = false;
+  const telemetry = { execute: ({ operation }) => operation(), shutdown: () => new Promise((resolve) => { released = () => { done = true; resolve(); }; }) };
+  const daemon = new GatewayDaemon({ telemetry });
+  const stopping = daemon.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(done, false);
+  released();
+  await stopping;
+  assert.equal(done, true);
 });
