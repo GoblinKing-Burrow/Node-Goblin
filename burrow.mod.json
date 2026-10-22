@@ -1,8 +1,15 @@
 {
   "id": "node-goblin",
   "name": "Node Goblin",
-  "version": "2026.10.19",
+  "version": "2026.10.22",
   "system": true,
+  "managedSkills": [
+    {
+      "id": "node-goblin-operations",
+      "repository": "https://github.com/GoblinKing-Burrow/Burrow-Skills.git",
+      "path": "node-goblin-operations"
+    }
+  ],
   "server": "server/index.mjs",
   "ui": {
     "settings": "ui/settings.js"
