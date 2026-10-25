@@ -1,12 +1,21 @@
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import tls from 'node:tls';
-import { controllerIdentity, pairingCode, verifyPairing } from './pairing.mjs';
+import { normalizeHostMetadata } from './host-metadata.mjs';
+import { controllerIdentity, pairingCode, verifyPairing, validPairingIdentity, validPending, boundedPending, MAX_PENDING_PAIRINGS } from './pairing.mjs';
 
 const AUTH_CONTEXT = 'burrow-host-gateway-auth-v1';
 import { MAX_FRAME_BYTES } from './output-frame.mjs';
 const DEFAULT_ACTIVITY_LIMIT = 256;
 const DEFAULT_CONFIGURATION_TIMEOUT_MS = 5_000;
+const SAFE_CONFIGURATION_REASONS = new Set([
+  'gateway_not_connected', 'gateway_not_ready', 'gateway_disconnected',
+  'gateway_configuration_timeout', 'telemetry_configuration_invalid',
+  'telemetry_endpoint_invalid', 'telemetry_headers_invalid',
+]);
+function configurationReason(error) {
+  return SAFE_CONFIGURATION_REASONS.has(error?.code) ? error.code : 'gateway_configuration_failed';
+}
 
 function optionalText(value, max = 255) {
   return typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : null;
@@ -38,6 +47,7 @@ function toGatewayRecords(gateways = []) {
   return new Map(gateways.map((gateway) => [
     requireText(gateway.gatewayId, 'gateway_id'),
     {
+      channelBinding: gateway.channelBinding === true,
       controllerId: requireText(gateway.controllerId ?? 'controller', 'controller_id'),
       ...(gateway.publicKey ? { publicKey: requireText(gateway.publicKey, 'public_key'), secret: gateway.secret || null } : { secret: requireText(gateway.secret, 'secret') }),
     },
@@ -94,7 +104,9 @@ class GatewayConnection extends EventEmitter {
     socket.on('data', (chunk) => this.onData(chunk));
     socket.on('error', (error) => this.listener.emit('gatewaySocketError', { connection: this, error }));
     socket.on('close', () => this.onClose());
-    this.send({ type: 'auth.challenge', nonce: this.nonce, controllerPublicKey: listener.pairingIdentity.publicKey });
+    const raw = socket.getCertificate?.()?.raw;
+    this.tlsFingerprint = raw ? crypto.createHash('sha256').update(raw).digest('hex') : null;
+    this.send({ channelBinding: 'tls-cert-sha256', type: 'auth.challenge', nonce: this.nonce, controllerPublicKey: listener.pairingIdentity.publicKey });
   }
 
   send(message) {
@@ -142,15 +154,21 @@ class GatewayConnection extends EventEmitter {
       return this.fail('invalid_auth_message');
     }
     const record = this.listener.gatewayRecords.get(gatewayId);
+    if (!record && (!validPairingIdentity(gatewayId) || !validPairingIdentity(controllerId))) return this.fail('invalid_auth_message');
+    const bound = message.channelBinding === 'tls-cert-sha256';
+    if ((!record || record.channelBinding) && !bound) return this.fail('channel_binding_required');
+    if (bound && !this.tlsFingerprint) return this.fail('channel_binding_unavailable');
+    const tlsFingerprint = bound ? this.tlsFingerprint : undefined;
     if (!record) {
-      if (typeof message.nodePublicKey !== 'string' || !verifyPairing({ nonce: this.nonce, gatewayId, gatewayPublicKey: message.nodePublicKey, controllerPublicKey: this.listener.pairingIdentity.publicKey, signature: message.pairingSignature })) return this.fail('unknown_node');
-      const registration = this.listener.registerPending({ gatewayId, controllerId, publicKey: message.nodePublicKey, metadata: safeGatewayMetadata(message.gateway), nonce: this.nonce, pairingCode: pairingCode({ nonce: this.nonce, gatewayId, gatewayPublicKey: message.nodePublicKey, controllerPublicKey: this.listener.pairingIdentity.publicKey }) }, this);
+      if (!validPending({ status: 'pending', gatewayId, controllerId, publicKey: message.nodePublicKey }) || !verifyPairing({ tlsFingerprint, nonce: this.nonce, gatewayId, gatewayPublicKey: message.nodePublicKey, controllerPublicKey: this.listener.pairingIdentity.publicKey, signature: message.pairingSignature })) return this.fail('unknown_node');
+      const registration = this.listener.registerPending({ gatewayId, controllerId, publicKey: message.nodePublicKey, channelBinding: true, metadata: safeGatewayMetadata(message.gateway), nonce: this.nonce, pairingCode: pairingCode({ tlsFingerprint, nonce: this.nonce, gatewayId, gatewayPublicKey: message.nodePublicKey, controllerPublicKey: this.listener.pairingIdentity.publicKey }) }, this);
+      if (!registration) return;
       this.gatewayId = gatewayId; this.controllerId = controllerId; this.gatewayMetadata = safeGatewayMetadata(message.gateway); this.state = 'pending';
       this.send({ type: 'pairing.pending', pairingCode: registration.pairingCode }); return;
     }
     if (controllerId !== record.controllerId) return this.fail('controller_identity_mismatch');
     if (record.publicKey) {
-      if (message.nodePublicKey !== record.publicKey || !verifyPairing({ nonce: this.nonce, gatewayId, gatewayPublicKey: record.publicKey, controllerPublicKey: this.listener.pairingIdentity.publicKey, signature: message.pairingSignature })) return this.fail('identity_mismatch');
+      if (message.nodePublicKey !== record.publicKey || !verifyPairing({ tlsFingerprint, nonce: this.nonce, gatewayId, gatewayPublicKey: record.publicKey, controllerPublicKey: this.listener.pairingIdentity.publicKey, signature: message.pairingSignature })) return this.fail('identity_mismatch');
     } else { const expected = controllerAuthenticationProof(record.secret, gatewayId, this.nonce); if (!safeEqualHex(expected, message.proof)) return this.fail('auth_failed'); }
     if (!this.listener.bindGatewayIdentity(gatewayId, this)) return this.fail('gateway_already_connected');
     this.gatewayId = gatewayId;
@@ -258,7 +276,7 @@ export class GatewayControllerListener extends EventEmitter {
     super();
     this.gatewayRecords = toGatewayRecords(gateways);
     for (const entry of gateways) if (entry.publicKey && this.gatewayRecords.has(entry.gatewayId)) this.gatewayRecords.get(entry.gatewayId).publicKey = entry.publicKey;
-    this.pairingIdentity = pairingIdentity; this.pending = new Map(pairings.map((entry) => [entry.gatewayId, entry]));
+    this.pairingIdentity = pairingIdentity; this.pending = new Map(boundedPending(pairings).map((entry) => [entry.gatewayId, entry]));
     this.connections = new Map();
     this.sockets = new Set();
     this.closing = false;
@@ -291,10 +309,11 @@ export class GatewayControllerListener extends EventEmitter {
   }
 
   registerPending(registration, connection) {
+    if (!this.pending.has(registration.gatewayId) && this.pending.size >= MAX_PENDING_PAIRINGS) { connection.fail('pending_pairings_full'); return null; }
     const existing = this.pending.get(registration.gatewayId);
-    const active = this.connections.get(registration.gatewayId); if (active && active !== connection && active.state !== 'closed') { connection.fail('gateway_already_connected'); return existing || registration; }
+    const active = this.connections.get(registration.gatewayId); if (active && active !== connection && active.state !== 'closed') { connection.fail('gateway_already_connected'); return null; }
+    if (existing && existing.publicKey !== registration.publicKey) { connection.fail('gateway_identity_conflict'); return null; }
     this.connections.set(registration.gatewayId, connection);
-    if (existing && existing.publicKey !== registration.publicKey) { connection.fail('gateway_identity_conflict'); return existing; }
     const value = { ...registration, generation: crypto.randomUUID(), status: 'pending', requestedAt: existing?.requestedAt || new Date().toISOString() }; this.pending.set(registration.gatewayId, value); this.emit('gatewayPairingPending', value); return value;
   }
   listPending() { return [...this.pending.values()].filter((entry) => entry.status === 'pending').map((entry) => ({ ...entry })); }
@@ -312,7 +331,7 @@ export class GatewayControllerListener extends EventEmitter {
     const entry = this.preparePendingApproval(gatewayId);
     const connection = this.connections.get(gatewayId);
     if (!entry || entry.nonce !== expected.nonce || entry.publicKey !== expected.publicKey || entry.generation !== expected.generation) return null;
-    this.gatewayRecords.set(gatewayId, { controllerId: entry.controllerId, publicKey: entry.publicKey, secret: null });
+    this.gatewayRecords.set(gatewayId, { controllerId: entry.controllerId, publicKey: entry.publicKey, channelBinding: true, secret: null });
     this.pending.delete(gatewayId);
     clearTimeout(connection.authTimer);
     connection.state = 'ready';
@@ -351,6 +370,7 @@ export class GatewayControllerListener extends EventEmitter {
   unbindGatewayIdentity(connection) {
     if (connection.gatewayId && this.connections.get(connection.gatewayId) === connection) {
       this.connections.delete(connection.gatewayId);
+      if (!this.gatewayRecords.has(connection.gatewayId)) { this.gatewayHealth.delete(connection.gatewayId); return; }
       const previous = this.gatewayHealth.get(connection.gatewayId) || {};
       this.gatewayHealth.set(connection.gatewayId, { ...previous, gatewayId: connection.gatewayId, status: 'disconnected', connected: false, connectedAt: null, lastSeenAt: connection.lastSeenAt, activeOperations: [] });
     }
@@ -458,6 +478,32 @@ export class GatewayControllerListener extends EventEmitter {
     return connection.dispatch('cancel', { operationId });
   }
 
+  // Read fresh interface state over the selected authenticated connection. Never
+  // infer the host's advertised addresses from a controller-side socket/NAT IP.
+  async describeHost(gatewayId, timeoutMs = 800) {
+    const connection = this.liveGateway(gatewayId);
+    if (!connection || connection.state !== 'ready') return null;
+    let timer;
+    try {
+      const dispatched = connection.dispatch('hello');
+      const requestId = [...connection.pendingRequests.keys()].at(-1);
+      const result = await Promise.race([
+        dispatched,
+        new Promise((resolve) => { timer = setTimeout(() => {
+          const pending = connection.pendingRequests.get(requestId);
+          if (pending) { connection.pendingRequests.delete(requestId); pending.resolve(null); }
+          resolve(null);
+        }, timeoutMs); timer.unref?.(); }),
+      ]);
+      // Disconnection/replacement during the request invalidates its snapshot.
+      if (this.liveGateway(gatewayId) !== connection || connection.state !== 'ready'
+        || result?.response?.ok !== true) return null;
+      const host = normalizeHostMetadata(result.response.result?.host);
+      return host ? { ...host, observedAt: new Date().toISOString() } : null;
+    } catch { return null; }
+    finally { clearTimeout(timer); }
+  }
+
   async dispatchTelemetryConfiguration(gatewayId, configuration, timeoutMs = DEFAULT_CONFIGURATION_TIMEOUT_MS) {
     const connection = this.liveGateway(gatewayId);
     if (!connection) throw Object.assign(new Error('gateway_not_connected'), { code: 'gateway_not_connected' });
@@ -473,18 +519,23 @@ export class GatewayControllerListener extends EventEmitter {
           reject(Object.assign(new Error('gateway_configuration_timeout'), { code: 'gateway_configuration_timeout' }));
         }, timeoutMs); timer.unref?.(); }),
       ]);
-      if (result?.response?.ok !== true) throw Object.assign(new Error(result?.response?.error?.code || 'gateway_configuration_failed'), { code: result?.response?.error?.code || 'gateway_configuration_failed' });
+      if (result?.response?.ok !== true) {
+        const code = configurationReason(result?.response?.error);
+        throw Object.assign(new Error(code), { code });
+      }
       return result;
     } finally { clearTimeout(timer); }
   }
 
   async configureTelemetry(configuration) {
     const connected = [...this.connections.entries()].filter(([, connection]) => connection.state === 'ready');
-    const results = await Promise.allSettled(connected.map(([gatewayId]) => this.dispatchTelemetryConfiguration(gatewayId, configuration).then((result) => ({ gatewayId, result }))));
+    const results = await Promise.allSettled(connected.map(([gatewayId]) => this.dispatchTelemetryConfiguration(gatewayId, configuration)));
     return {
       configured: connected.length,
       succeeded: results.filter((entry) => entry.status === 'fulfilled').length,
       failed: results.filter((entry) => entry.status === 'rejected').length,
+      failures: results.flatMap((entry, index) => entry.status === 'rejected'
+        ? [{ gatewayId: connected[index][0], reason: configurationReason(entry.reason) }] : []),
     };
   }
 }

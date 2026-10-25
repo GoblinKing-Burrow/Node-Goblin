@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import process from 'node:process';
@@ -11,6 +12,7 @@ class FakeSocket extends EventEmitter {
     this.destroyed = false;
     this.writable = true;
   }
+  getCertificate() { return { raw: Buffer.from("test-controller-cert") }; }
   setEncoding() {}
   write(value) {
     this.writes.push(String(value));
@@ -175,7 +177,7 @@ test('fans telemetry configuration to authenticated gateways', async () => {
     const outbound = socket.messages().find((message) => message.method === 'telemetry.configure');
     assert.equal(outbound.params.headers, 'x-token=private');
     socket.feed({ type: 'response', requestId: outbound.id, ok: true, result: { configured: true, source: 'controller' } });
-    assert.deepEqual(await pending, { configured: 1, succeeded: 1, failed: 0 });
+    assert.deepEqual(await pending, { configured: 1, succeeded: 1, failed: 0, failures: [] });
   } finally { listener.close(); }
 });
 
@@ -255,8 +257,8 @@ test('pending approval is committed only after its live challenge is revalidated
   const identity = loadNodeIdentity(stateDir);
   try {
     const nonce = socket.messages()[0].nonce;
-    socket.feed({ type: 'auth.response', gatewayId: 'fresh-node', controllerId: 'controller', nodePublicKey: identity.publicKey,
-      pairingSignature: signPairing(identity, nonce, 'fresh-node', pairingIdentity.publicKey) });
+    socket.feed({ type: 'auth.response', channelBinding: 'tls-cert-sha256', gatewayId: 'fresh-node', controllerId: 'controller', nodePublicKey: identity.publicKey,
+      pairingSignature: signPairing(identity, nonce, 'fresh-node', pairingIdentity.publicKey, crypto.createHash('sha256').update(Buffer.from('test-controller-cert')).digest('hex')) });
     const pending = listener.preparePendingApproval('fresh-node');
     assert.equal(pending.gatewayId, 'fresh-node');
     assert.equal(socket.messages().some((message) => message.type === 'auth.ok'), false);
@@ -343,4 +345,51 @@ test('listener bounds authentication lifetime', async () => {
   assert.equal(socket.destroyed, true);
   assert.equal(socket.messages().at(-1).error.code, 'authentication_timeout');
   await listener.close();
+});
+
+test('describeHost reads current authenticated hello metadata, tolerates old gateways, and clears deadlines', async () => {
+  const { listener, server } = listenerFixture();
+  const socket = server.connect();
+  try {
+    assert.equal(await listener.describeHost('gateway-1'), null);
+    authenticate(socket);
+    const host = { hostname: 'worker', platform: 'linux', addresses: [
+      { interface: 'docker0', family: 'IPv4', address: '172.17.0.1', interfaceKind: 'lan-candidate', mac: 'secret' },
+      { interface: 'eno1', family: 'IPv4', address: '10.10.20.105' },
+      { interface: 'evil\ntext', family: 'IPv4', address: '10.0.0.1' },
+    ] };
+    const read = listener.describeHost('gateway-1');
+    const request = socket.messages().at(-1);
+    assert.equal(request.method, 'hello');
+    socket.feed({ type: 'response', requestId: request.id, ok: true, result: { host } });
+    const result = await read;
+    assert.equal(result.hostname, 'worker');
+    assert.equal(result.addresses[0].address, '10.10.20.105');
+    assert.equal(result.addresses[1].interfaceKind, 'container');
+    assert.equal(JSON.stringify(result).includes('mac'), false);
+    assert.ok(Number.isFinite(Date.parse(result.observedAt)));
+    const legacy = listener.describeHost('gateway-1');
+    socket.feed({ type: 'response', requestId: socket.messages().at(-1).id, ok: true, result: { name: 'old' } });
+    assert.equal(await legacy, null);
+    const keepAlive = setInterval(() => {}, 20);
+    try { assert.equal(await listener.describeHost('gateway-1', 10), null); }
+    finally { clearInterval(keepAlive); }
+    assert.equal(listener.liveGateway('gateway-1').pendingRequests.size, 0);
+    const disconnected = listener.describeHost('gateway-1');
+    socket.destroy();
+    assert.equal(await disconnected, null);
+  } finally { listener.close(); }
+});
+
+
+test('failed configuration reports gateway identity and allowlisted reason without host error content', async () => {
+  const { listener, server } = listenerFixture();
+  const socket = server.connect();
+  try {
+    authenticate(socket);
+    const pending = listener.configureTelemetry({ enabled: true, endpoint: 'https://collector.example', headers: 'authorization=secret-token' });
+    const outbound = socket.messages().find((message) => message.method === 'telemetry.configure');
+    socket.feed({ type: 'response', requestId: outbound.id, ok: false, error: { code: 'private collector response secret-token' } });
+    assert.deepEqual(await pending, { configured: 1, succeeded: 0, failed: 1, failures: [{ gatewayId: 'gateway-1', reason: 'gateway_configuration_failed' }] });
+  } finally { listener.close(); }
 });

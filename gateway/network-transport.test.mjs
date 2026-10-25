@@ -7,6 +7,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { authenticationProof, enrollController, enrollmentConsumedPath, markEnrollmentConsumed, OutboundGatewayTransport, pairingCodePath, readControllerTrust, writePairingCode } from './lib/network-transport.mjs';
 import { controllerIdentity } from './lib/pairing.mjs';
+import { GatewayDaemon } from './lib/daemon.mjs';
+import { createGatewayTelemetry } from './lib/otel-runtime.mjs';
 import { MAX_FRAME_BYTES } from './lib/output-frame.mjs';
 
 class FakeSocket extends EventEmitter {
@@ -108,6 +110,20 @@ test('unauthenticated and malformed requests cannot reach daemon', async () => {
     assert.equal(messages[2].error.code, 'invalid_json');
     assert.equal(transport.daemon.controllers.size, 0);
   } finally { transport.stop(); }
+});
+
+test('authenticated network hello returns current bounded host metadata', async () => {
+  const { transport, sockets } = fixture();
+  try {
+    authenticate(sockets[0]);
+    sockets[0].feed({ id: 'host-hello', method: 'hello' });
+    await waitFor(() => sockets[0].messages().some((message) => message.requestId === 'host-hello'));
+    const host = sockets[0].messages().find((message) => message.requestId === 'host-hello').result.host;
+    assert.equal(typeof host.hostname === 'string' || host.hostname === null, true);
+    assert.equal(typeof host.platform === 'string' || host.platform === null, true);
+    assert.equal(Array.isArray(host.addresses), true);
+    assert.equal(host.addresses.every((entry) => !Object.hasOwn(entry, 'mac') && !Object.hasOwn(entry, 'reachable')), true);
+  } finally { await transport.stop(); }
 });
 
 test('authenticated execution correlates accepted, terminal evidence, and response', async () => {
@@ -248,7 +264,7 @@ test('no-CA first pairing permits only bootstrap TLS, pins the approved controll
     sockets[0].emit('secureConnect');
     const controller = controllerIdentity();
     const nonce = '0123456789abcdef';
-    sockets[0].feed({ type: 'auth.challenge', nonce, controllerPublicKey: controller.publicKey });
+    sockets[0].feed({ type: 'auth.challenge', channelBinding: 'tls-cert-sha256', nonce, controllerPublicKey: controller.publicKey });
     const response = sockets[0].messages()[0];
     assert.equal(response.nodePublicKey != null, true);
     sockets[0].feed({ type: 'pairing.pending', pairingCode: response.pairingCode });
@@ -259,7 +275,7 @@ test('no-CA first pairing permits only bootstrap TLS, pins the approved controll
     sockets[0].destroy(); transport.timer && clearTimeout(transport.timer); transport.timer = null; transport.connect();
     assert.equal(sockets[1].options.rejectUnauthorized, false);
     sockets[1].emit('secureConnect');
-    sockets[1].feed({ type: 'auth.challenge', nonce: 'fedcba9876543210', controllerPublicKey: controller.publicKey });
+    sockets[1].feed({ type: 'auth.challenge', channelBinding: 'tls-cert-sha256', nonce: 'fedcba9876543210', controllerPublicKey: controller.publicKey });
     assert.equal(sockets[1].messages()[0].nodePublicKey != null, true);
     sockets[1].feed({ type: 'auth.ok', connectionId: 'approved-2' }); assert.equal(transport.authenticated, true);
     sockets[1].destroy(); transport.timer && clearTimeout(transport.timer); transport.timer = null; transport.connect();
@@ -274,7 +290,7 @@ test('unconfirmed bootstrap never persists trust or admits requests; mismatched 
     const socket = sockets[0];
     socket.getPeerCertificate = () => ({ raw: Buffer.from('certificate') });
     socket.emit('secureConnect');
-    socket.feed({ type: 'auth.challenge', nonce: '0123456789abcdef', controllerPublicKey: controllerIdentity().publicKey });
+    socket.feed({ type: 'auth.challenge', channelBinding: 'tls-cert-sha256', nonce: '0123456789abcdef', controllerPublicKey: controllerIdentity().publicKey });
     const code = socket.messages()[0].pairingCode;
     socket.feed({ type: 'auth.ok' });
     assert.equal(transport.authenticated, false);
@@ -292,14 +308,37 @@ test('local confirmation is transcript-scoped and is discarded on reconnect', ()
   const { transport, sockets, stateDir } = fixture({ enrollmentToken: undefined });
   try {
     const controller = controllerIdentity();
-    sockets[0].feed({ type: 'auth.challenge', nonce: '0123456789abcdef', controllerPublicKey: controller.publicKey });
+    sockets[0].getPeerCertificate = () => ({ raw: Buffer.from('certificate') });
+    sockets[0].emit('secureConnect');
+    sockets[0].feed({ type: 'auth.challenge', channelBinding: 'tls-cert-sha256', nonce: '0123456789abcdef', controllerPublicKey: controller.publicKey });
     const oldCode = sockets[0].messages()[0].pairingCode;
     assert.equal(transport.confirmControllerPairing(oldCode), true);
     sockets[0].destroy(); clearTimeout(transport.timer); transport.timer = null; transport.connect();
-    sockets[1].feed({ type: 'auth.challenge', nonce: 'fedcba9876543210', controllerPublicKey: controller.publicKey });
+    sockets[1].getPeerCertificate = () => ({ raw: Buffer.from('certificate') });
+    sockets[1].emit('secureConnect');
+    sockets[1].feed({ type: 'auth.challenge', channelBinding: 'tls-cert-sha256', nonce: 'fedcba9876543210', controllerPublicKey: controller.publicKey });
     assert.equal(transport.confirmControllerPairing(oldCode), false);
     sockets[1].feed({ type: 'auth.ok' });
     assert.equal(transport.authenticated, false);
     assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, 'node-identity.json'))).controllerPublicKey, undefined);
   } finally { transport.stop(); fs.rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+
+test('configuration delivered immediately after authentication is acknowledged despite a hung export', async () => {
+  let started;
+  const exportStarted = new Promise((resolve) => { started = resolve; });
+  const telemetry = createGatewayTelemetry({ env: { OTEL_EXPORTER_OTLP_ENDPOINT: 'https://host.example' }, fetchImpl: async () => { started(); return new Promise(() => {}); } });
+  const daemon = new GatewayDaemon({ telemetry });
+  const { transport, sockets, stateDir } = fixture({ daemon, reconnectMinMs: 10000, reconnectMaxMs: 10000 });
+  try {
+    await telemetry.execute({ kind: 'process', operation: async () => ({ exitCode: 0 }) });
+    void telemetry.flush();
+    await exportStarted;
+    authenticate(sockets[0]);
+    assert.equal(transport.authenticated, true);
+    sockets[0].feed({ id: 'config-1', method: 'telemetry.configure', params: { enabled: true, endpoint: 'https://controller.example', headers: 'authorization=private==' } });
+    await waitFor(() => sockets[0].messages().some((message) => message.requestId === 'config-1'));
+    assert.equal(sockets[0].messages().find((message) => message.requestId === 'config-1').ok, true);
+  } finally { await transport.stop({ flushTelemetry: false }); await telemetry.shutdown({ timeout: 20 }); fs.rmSync(stateDir, { recursive: true, force: true }); }
 });

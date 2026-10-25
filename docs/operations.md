@@ -26,6 +26,7 @@ Protect logs before sharing them. Pairing logs contain pairing codes; process re
 | Controller appears disabled | Saved enabled flag and restart | Save desired settings and restart BURROW |
 | TLS generation failed | OpenSSL availability and controller secret storage | Supply reviewed TLS material or restore required tooling/storage |
 | Certificate/identity mismatch | Current controller key/cert vs host's saved trust | Investigate unexpected change; do not bypass trust checks blindly |
+| `channel_binding_required` on a new pairing | Controller and host pairing-protocol compatibility | Update both to compatible channel-binding-capable versions; do not bypass identity checks |
 | Pending request cannot be approved | Current node connection/nonce vs persisted pending record | Reconnect and compare the fresh code |
 | Gateway already connected | Duplicate gateway ID or cloned state | Stop the unintended duplicate; preserve independent host identities |
 | `gateway_not_connected` / `gateway_not_ready` | Connection and approval state | Establish trusted connection before execution |
@@ -45,12 +46,18 @@ A cancel response only says whether an active operation was asked to abort. Wait
 ## Upgrade procedure
 
 1. Record the currently installed release and controller assignment/trust state.
-2. Stop or drain work and stop the host service before replacing program files.
+2. Drain work. Use a local terminal or SSH session independent of Node Goblin; the update stops its service and service-owned child processes.
 3. Make protected backups of configuration and state. Preserve ownership and permissions.
-4. Review and install the selected release. The installer preserves config/state but replaces the executable package.
-5. Restart BURROW if mod/controller changes require it; start the gateway service.
+4. Review and run the bootstrap with `sudo sh install.sh --update` (latest) or `sudo sh install.sh --update --version YYYY.MM.DD[.N]` using an actual published version. Alternatively extract the selected verified archive and run `sudo sh deploy/update.sh`. The update validates/stages the replacement, stops the service, installs it, reloads systemd, restarts, and checks active state as one operation. It preserves configuration, identity, trust, and operation journal. First-time `install.sh` behavior is unchanged.
+5. If installation/restart fails, the updater restores the previous package/deployment assets and attempts to restart the old service; it exits nonzero. If stopping the candidate or restoring assets fails, recovery assets are retained at the path reported in the error. Do not treat a failed update as success. Restart BURROW only if separate mod/controller changes require it.
 6. Verify authentication, target selection, a harmless process, and a filesystem read in the intended workspace.
 7. Keep the prior program package until the new version is verified. A code rollback does not automatically roll back external process side effects or storage format changes.
+
+The public bootstrap downloads from `GoblinKing-Burrow/Node-Goblin`. Development
+packages from `NightShaman/Node-Goblin` are separate; use the README's explicit
+repository override only when intentionally testing them. The immutable public
+`2026.10.23` release predates `--update`; public updater availability requires a
+later promoted release containing it.
 
 Node Goblin releases have their own calendar versions and packages. Use the selected Node Goblin release and checksum when upgrading the host; a BURROW upgrade is not evidence that the host runtime changed.
 
@@ -79,3 +86,15 @@ Uninstall deliberately preserves configuration and state. Secure decommissioning
 - [`gateway/deploy/uninstall.sh`](https://github.com/GoblinKing-Burrow/Node-Goblin/blob/main/gateway/deploy/uninstall.sh)
 - [`gateway/lib/network-transport.mjs`](https://github.com/GoblinKing-Burrow/Node-Goblin/blob/main/gateway/lib/network-transport.mjs)
 - [`gateway/lib/journal.mjs`](https://github.com/GoblinKing-Burrow/Node-Goblin/blob/main/gateway/lib/journal.mjs)
+
+### Controller TLS replacement
+
+Saving replacement TLS credentials or clearing them requires a controller restart.
+Clearing credentials causes regeneration when the listener is next enabled; the
+certificate fingerprint changes. Existing key-paired hosts pin the DER certificate
+and can refuse the replacement. Coordinate the change, verify the new controller
+identity independently, and use the verified unpair/re-pair procedure in
+[pairing](pairing.md). Do not disable validation or delete identity/journal state.
+The controller cannot observe a host's saved pin or diagnose a remote pin mismatch
+from a disconnect; inspect the host's local `controller_tls_identity_mismatch`
+diagnostic. TLS metadata fingerprints use SHA-256 over DER, not PEM text.

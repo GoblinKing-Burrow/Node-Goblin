@@ -98,7 +98,7 @@ Staging intentionally avoids account ownership changes. `connect`/`apply` refuse
 
 ## Update or uninstall
 
-For the mod, `git pull --ff-only` updates a clean checkout; then restart BURROW. Review the incoming revision first. For the host package, stop the service, preserve a protected backup, install the selected replacement, and start/verify it. See [operations](operations.md).
+For the mod, `git pull --ff-only` updates a clean checkout; then restart BURROW. Review the incoming revision first. For the host package, drain work and preserve a protected backup, then run `sudo sh install.sh --update` with the reviewed bootstrap, or `sudo sh deploy/update.sh` from the selected verified release archive. Both install and restart together; verify controller connection and an operation afterward. Run locally or over SSH, not through the service being updated. See [operations](operations.md).
 
 `sudo node-goblin uninstall` removes runtime files, command links, and the unit. It preserves the account, configuration, identity/trust, and journal for reinstall. It is not a credential purge.
 
@@ -113,4 +113,4 @@ For the mod, `git pull --ff-only` updates a clean checkout; then restart BURROW.
 
 On compatible Core and mod builds that declare managed skills, loading this mod automatically supplies the `node-goblin-operations` skill from [Burrow-Skills](https://github.com/GoblinKing-Burrow/Burrow-Skills/tree/main/node-goblin-operations). Core maintains the installed copy as read-only and refreshes managed skills at startup, on mod lifecycle changes, and on its default six-hour schedule. You do not paste, edit, or assign that managed copy manually. The skill provides instructions; it does not grant tool or data access.
 
-The public **2026.10.19** mod snapshot does not yet declare this managed skill. Automatic mod-managed delivery requires both the newer manifest and a Core build that supports it; updating only the skill repository cannot add the missing integration. See [how managed skills work](https://burrow-docs.blissful-psychosis.com/burrow-skills/managed-skills/).
+The current mod manifest declares this managed skill. Automatic mod-managed delivery still requires a Core build that supports it. Older public **2026.10.19** snapshots lack the declaration; updating only the skill repository cannot add the missing integration to those older packages. See [how managed skills work](https://burrow-docs.blissful-psychosis.com/burrow-skills/managed-skills/).
