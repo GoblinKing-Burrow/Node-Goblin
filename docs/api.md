@@ -53,10 +53,35 @@ Pairing approval requires the current live pending transcript and its matching c
 | --- | --- | --- |
 | `GET /gateways` | None | `{ok, gateways}` with connection/implementation/operation metadata |
 | `GET /operations` | Optional `gatewayId`, `limit` query | `{ok, operations, limit}` |
+| `GET /operations/archive` | Required `timeZone`; optional `date`, `gatewayId`, `q`, `limit`, `cursor` | `{ok, operations, nextCursor, hasMore, history}` |
 | `POST /gateways/:gatewayId/processes` | Operation ID and process request | `{ok, operationId, dispatch}` |
 | `POST /gateways/:gatewayId/operations/:operationId/cancel` | Path IDs | `{ok, operationId, dispatch}` |
 
 Operation IDs match `[a-z0-9][a-z0-9._:-]{0,255}` case-insensitively. `limit` defaults 50 and is clamped to 1–256 when integral. Invalid nonintegral input selects 50. Gateway filters use gateway-ID validation.
+
+### Archive operation window
+
+`GET /operations/archive` is a read-only projection of all currently retained
+listener metadata, shown in **Archive → MODS → Node Goblin**. Send `timeZone` as an
+IANA browser timezone, and optional `date=YYYY-MM-DD` (omit for All dates),
+`gatewayId`, `q`, `limit` (1–200, default 50), and opaque `cursor`. `q` is limited to 200 characters; page limits must be integers
+from 1 through 200 rather than being silently clamped. Date filtering
+matches operation `startedAt` in that timezone, including DST transitions. Search
+matches safe gateway/operation IDs, kind, state and outcome metadata.
+
+Response: `{ok, operations, nextCursor, hasMore, history}`. Operations retain
+IDs, lifecycle state, timing, replay and reconnect hints, not commands, protected
+values or output. The `history` metadata reports `available`, `retainedEntries`,
+`maxEntries`, `matchedEntries`, `complete:false` and `volatile:true`. An unavailable
+buffer is not evidence that no work occurred. Paging is live, ordered by
+`startedAt`, gateway ID and operation ID descending; concurrent updates, eviction
+and revocation can change later pages. Keep filters unchanged with a cursor;
+activation/restart invalidates cursors. Invalid filters/cursors return 400.
+
+This does not change listener retention (default 256, existing maximum 1000),
+replay/correlation authority, cancellation or dispatch. Restart loses the window;
+oldest-updated entries are evicted at capacity; revocation clears the gateway's
+entries. The legacy latest-N `/operations` route remains compatible.
 
 The process route requires either a nonempty `command` or a nonempty `executable`, never both; `args` is an array of strings and cannot be nonempty with `command`. Remaining body fields are forwarded to the dispatch service. Only supply reviewed options documented in the [protocol](protocol.md).
 
@@ -79,6 +104,9 @@ The UI requires an absolute workspace root and a gateway for remote assignments.
 Use a current authenticated Burrow session and the normal administrative UI for credential changes. Never put TLS keys, HMAC secrets, protected values, or process output into logs or URLs. Do not automatically retry a mutating process with a new ID after a timeout. [Replay and recovery](protocol.md#replay-guarantees-and-limits) explains the evidence required.
 
 ## Source references
+
+- [`server/operation-archive.mjs`](https://github.com/GoblinKing-Burrow/Node-Goblin/blob/main/server/operation-archive.mjs)
+- [`ui/archive.js`](https://github.com/GoblinKing-Burrow/Node-Goblin/blob/main/ui/archive.js)
 
 - [`server/index.mjs`](https://github.com/GoblinKing-Burrow/Node-Goblin/blob/main/server/index.mjs)
 - [`ui/settings.js`](https://github.com/GoblinKing-Burrow/Node-Goblin/blob/main/ui/settings.js)
