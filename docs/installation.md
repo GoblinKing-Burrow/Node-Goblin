@@ -130,20 +130,24 @@ For the mod, `git pull --ff-only` updates a clean checkout; then restart BURROW.
 
 ## Optional Codex CLI for native minions
 
-If this execution host will run Burrow's native Codex minions, opt in to installing Codex on **this host**, not merely inside the Burrow container. The reviewed bootstrap, package installer, and package updater accept `--with-codex`:
+Both **Codex and Claude native minions** need their CLI on the selected execution host, not merely inside Burrow's container. The reviewed bootstrap, package installer and updater accept `--with-codex`, `--with-claude`, or both:
 
 ```bash
 # From a verified, extracted Node Goblin release:
-sudo sh deploy/install.sh --with-codex
+sudo sh deploy/install.sh --with-codex --with-claude
 # For an existing configured installation, after draining work:
-sudo sh deploy/update.sh --with-codex
+sudo sh deploy/update.sh --with-codex --with-claude
 ```
 
-This option requires `npm` and installs `@openai/codex@latest` globally under `/usr/local` on a normal installation. Each explicit opt-in install/update requests the latest CLI; it is not pinned to the Node Goblin release. The ordinary installer does not install Codex.
+Neither CLI is installed by default. Opt-ins require npm and install `@openai/codex@latest` and/or `@anthropic-ai/claude-code@latest` globally under `/usr/local`, without version pins. Successful choices are remembered in the installed package; subsequent Node Goblin updates fetch those latest CLIs again even without repeating the flags. Older installations made before opt-in tracking must supply their flags once.
 
-The gateway discovers an executable `codex` through its service `PATH`, or an absolute `BURROW_CODEX_EXECUTABLE` override. Discovery reports executable availability only, not OpenAI authentication or model eligibility. Burrow must also support native Codex minions and have the appropriate model connection configured.
+Claude provisioning suppresses all npm lifecycle scripts with `--ignore-scripts`, includes native optional dependencies, and explicitly runs only the installed vendor `install.cjs`. It verifies the launcher at the selected installation prefix with `claude --version`; it does not change global npm script approvals. A missing vendor entrypoint, vendor failure or nonworking launcher aborts provisioning. **CLI upgrades are outside package rollback:** restoring Node Goblin after a failed update does not downgrade an already upgraded provider CLI.
 
-The app-server uses `CODEX_HOME` when set, otherwise `BURROW_GATEWAY_STATE_DIR/codex` when the state-directory variable is set. This lets the normal non-login service account use its writable state directory rather than requiring a home directory. Protect that state and never copy authentication data into command arguments or diagnostics.
+The gateway discovers executable `codex` and `claude` in absolute service `PATH` entries and standard system bin directories, including `/usr/local/bin`. Absolute `BURROW_CODEX_EXECUTABLE` and `BURROW_CLAUDE_EXECUTABLE` overrides take precedence. The service account must be able to traverse and execute the selected file. Discovery reports availability and protocol only, not authentication or model eligibility. Configure the corresponding native minion harness and eligible connection in compatible Burrow Core separately.
+
+Codex uses `CODEX_HOME` when set, otherwise `$BURROW_GATEWAY_STATE_DIR/codex` when the state-directory variable is set. Claude uses private writable `HOME` and configuration under `$BURROW_GATEWAY_STATE_DIR/claude` on the packaged service, which does not need a login home. Protect these directories. Claude OAuth is delivered transiently by the authenticated controller into the child environment, not installer arguments or a persistent gateway token setting.
+
+The current Claude transport requires the headless JSONL CLI contract with `--permission-prompts none` and the explicit native coding-tool set `Bash,Edit,Write,Read,Glob,Grep,NotebookEdit`. These are broad native coding permissions, not an operating-system sandbox or workspace confinement. Other permission requests are denied without waiting for an interactive host; there is no permission-bypass fallback. Use a CLI that supports this contract, then verify an authorized harmless minion operation. Finding an executable alone does not prove successful inference.
 
 ## Source references
 

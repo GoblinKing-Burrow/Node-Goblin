@@ -84,3 +84,110 @@ test('deployment artifacts enforce dedicated account, outbound config, and no se
   assert.match(operatorCli, /is-active --quiet/);
   assert.doesNotMatch(operatorCli, /ENROLLMENT_TOKEN=.*\$[12]/);
 });
+
+test('optional latest CLIs persist through flag-free updates; failed provisioning does not opt in', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'burrow-cli-provision-'));
+  try {
+    const root = path.join(tmp, 'root'), bin = path.join(tmp, 'bin'), log = path.join(tmp, 'npm.log');
+    fs.mkdirSync(bin);
+    // Model npm with scripts blocked: the package has a failing stub until
+    // its exact vendor installer places the native launcher. No fake node.
+    fs.writeFileSync(path.join(bin, 'npm'), `#!${process.execPath}
+const fs = require('node:fs'), path = require('node:path');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.NPM_LOG, args.join(' ') + '\\n');
+if (process.env.NPM_STATUS) process.exit(Number(process.env.NPM_STATUS));
+if (args.at(-1) !== '@anthropic-ai/claude-code@latest') process.exit(0);
+if (!args.includes('--ignore-scripts') || !args.includes('--include=optional')) process.exit(90);
+const prefix = args[args.indexOf('--prefix') + 1];
+const pkg = path.join(prefix, 'lib/node_modules/@anthropic-ai/claude-code');
+fs.mkdirSync(path.join(pkg, 'bin'), { recursive: true });
+fs.mkdirSync(path.join(prefix, 'bin'), { recursive: true });
+const stub = '#!/bin/sh\\necho "native binary not installed" >&2\\nexit 1\\n';
+fs.writeFileSync(path.join(pkg, 'bin/claude.exe'), stub, { mode: 0o755 });
+const launcher = path.join(prefix, 'bin/claude');
+fs.rmSync(launcher, { force: true });
+fs.symlinkSync(path.join(pkg, 'bin/claude.exe'), launcher);
+const vendor = "const fs = require('node:fs');" +
+  "fs.appendFileSync(process.env.VENDOR_LOG, process.cwd() + '\\\\n');" +
+  "if (process.env.VENDOR_STATUS) process.exit(Number(process.env.VENDOR_STATUS));" +
+  "if (!process.env.LEAVE_STUB) { fs.copyFileSync('native', 'bin/claude.exe'); fs.chmodSync('bin/claude.exe', 0o755); }";
+fs.writeFileSync(path.join(pkg, 'install.cjs'), vendor);
+if (process.env.MISSING_INSTALLER) fs.rmSync(path.join(pkg, 'install.cjs'));
+fs.writeFileSync(path.join(pkg, 'native'), '#!/bin/sh\\n[ "$1" = --version ] || exit 92\\nprintf "%s\\\\n" "$0" >> "$VERIFY_LOG"\\necho "2.1.117 (Claude Code)"\\nexit "' + (process.env.LAUNCHER_STATUS || '0') + '"\\n');
+`, { mode: 0o755 });
+    const systemctl = path.join(bin, 'systemctl');
+    fs.writeFileSync(systemctl, '#!/bin/sh\ncase "$*" in *LoadState*) echo loaded;; *ActiveState*) echo inactive;; esac\nexit 0\n', { mode: 0o755 });
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, NPM_LOG: log, VENDOR_LOG: path.join(tmp, 'vendor.log'), VERIFY_LOG: path.join(tmp, 'verify.log') };
+    const stage = (args = [], extra = {}) => spawnSync(install, ['--root', root, '--skip-account', '--no-systemd', ...args], { env: { ...env, ...extra }, encoding: 'utf8' });
+    let result = stage(); assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(log), false);
+    result = stage(['--with-claude'], { NPM_STATUS: '1' });
+    assert.notEqual(result.status, 0);
+    const marker = path.join(root, 'opt/burrow-host-gateway/.with-claude');
+    assert.equal(fs.existsSync(marker), false);
+    for (const extra of [{ VENDOR_STATUS: '1' }, { LEAVE_STUB: '1' }, { LAUNCHER_STATUS: '1' }, { MISSING_INSTALLER: '1' }]) {
+      result = stage(['--with-claude'], extra);
+      assert.notEqual(result.status, 0, JSON.stringify(extra));
+      assert.equal(fs.existsSync(marker), false);
+      assert.doesNotMatch(result.stdout, /Node Goblin installed/);
+    }
+    fs.writeFileSync(log, '');
+    fs.writeFileSync(env.VENDOR_LOG, '');
+    fs.writeFileSync(env.VERIFY_LOG, '');
+    result = stage(['--with-claude', '--with-codex']); assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(marker), true);
+    fs.writeFileSync(path.join(root, 'etc/burrow-host-gateway/gateway.env'), 'BURROW_GATEWAY_CONTROLLER_URL=tls://controller:7443\nBURROW_GATEWAY_ID=test-node\n');
+    result = spawnSync(path.join(gateway, 'deploy/update.sh'), ['--root', root, '--skip-account'], { env: { ...env, SYSTEMCTL: systemctl }, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    const calls = fs.readFileSync(log, 'utf8').trim().split('\n');
+    assert.equal(calls.length, 4);
+    for (const pkg of ['@openai/codex@latest', '@anthropic-ai/claude-code@latest']) {
+      assert.equal(calls.filter(line => line === `install --global --prefix ${root}/usr/local --no-audit --no-fund ${pkg.startsWith('@anthropic-ai/') ? '--ignore-scripts --include=optional ' : ''}${pkg}`).length, 2);
+    }
+    assert.equal(fs.existsSync(marker), true);
+    assert.deepEqual(fs.readFileSync(env.VENDOR_LOG, 'utf8').trim().split('\n'), Array(2).fill(`${root}/usr/local/lib/node_modules/@anthropic-ai/claude-code`));
+    assert.deepEqual(fs.readFileSync(env.VERIFY_LOG, 'utf8').trim().split('\n'), Array(2).fill(`${root}/usr/local/bin/claude`));
+    // A failed flag-free update cannot report success or replace the package.
+    const version = fs.readFileSync(path.join(root, 'opt/burrow-host-gateway/VERSION'), 'utf8');
+    result = stage([], { LEAVE_STUB: '1' });
+    assert.notEqual(result.status, 0);
+    assert.doesNotMatch(result.stdout, /Node Goblin installed/);
+    assert.equal(fs.readFileSync(path.join(root, 'opt/burrow-host-gateway/VERSION'), 'utf8'), version);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('Gemini opt-in installs latest, verifies launcher and persists across flag-free updates', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'burrow-gemini-provision-'));
+  const root = path.join(tmp, 'root'), bin = path.join(tmp, 'bin'), log = path.join(tmp, 'npm.log');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'npm'), `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "$NPM_LOG"
+[ "\${NPM_FAIL:-0}" = 0 ] || exit 1
+prefix=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --prefix ]; then prefix=$2; shift; fi
+  shift
+done
+mkdir -p "$prefix/bin"
+printf '#!/bin/sh\\nexit 0\\n' > "$prefix/bin/gemini"
+chmod 755 "$prefix/bin/gemini"
+`, { mode: 0o755 });
+  const stage = (args = [], extra = {}) => spawnSync(install, ['--root', root, '--skip-account', '--no-systemd', ...args], {
+    encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, NPM_LOG: log, ...extra },
+  });
+  try {
+    const marker = path.join(root, 'opt/burrow-host-gateway/.with-gemini');
+    assert.notEqual(stage(['--with-gemini'], { NPM_FAIL: '1' }).status, 0);
+    assert.equal(fs.existsSync(marker), false);
+    fs.writeFileSync(log, '');
+    for (const args of [['--with-gemini'], []]) {
+      const result = stage(args); assert.equal(result.status, 0, result.stderr);
+      assert.equal(fs.existsSync(marker), true);
+    }
+    const lines = fs.readFileSync(log, 'utf8').trim().split('\n');
+    assert.equal(lines.length, 2);
+    for (const line of lines) assert.match(line, /@google\/gemini-cli@latest$/);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
