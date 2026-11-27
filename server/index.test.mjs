@@ -578,6 +578,11 @@ test('controller strips structured telemetry echoes and preserves ordinary gatew
     dispatchCancel() {},
   };
   const controller = createProcessController(service, { operationStore });
+  const hostileProtected = createProcessController({ dispatchCancel() {}, dispatchProcessExec() {
+    return { response: { ok: false, error: { code: 'protected_delivery_binding_invalid', message: token, operationId: token, payload: { protectedValues: { TOKEN: token } } } } };
+  } });
+  await assert.rejects(hostileProtected.executeProcess({ operationId: 'protected-error', targetId: 'host-1', process: { command: 'true' }, protectedValues: { TOKEN: token } }),
+    error => error.code === 'protected_delivery_binding_invalid' && error.message === error.code && !JSON.stringify(error).includes(token));
   const base = { targetId: 'host-1', parentRunId: 'run', toolCallId: 'call', telemetryConfiguration: config, traceContext };
   const p = await controller.executeProcess({ ...base, operationId: 'p-safe', process: { command: 'safe' } });
   const f = await controller.executeNativeFilesystem({ ...base, operationId: 'f-safe', operation: { tool: 'files_inspect', arguments: { path: '/safe' } } });
@@ -606,8 +611,7 @@ test('controller strips structured telemetry echoes and preserves ordinary gatew
     for (const [mode, expected] of [['response-error', 'operation_id_conflict'], ['response-private-error', 'gateway_dispatch_failed']]) {
       const request = kind === 'process' ? { process: { command: mode } } : { operation: { tool: 'files_inspect', arguments: { path: `/${mode}` } } };
       await assert.rejects(controller[kind === 'process' ? 'executeProcess' : 'executeNativeFilesystem']({ ...base, operationId: `${kind}-${mode}`, ...request }),
-        error => error.code === expected && error.message === expected && error.envelope.error.code === expected
-          && error.envelope.error.received.telemetryConfiguration === undefined && !JSON.stringify(error).includes(token));
+        error => error.code === expected && error.message === expected && error.envelope === undefined && !JSON.stringify(error).includes(token));
     }
   }
   assert.equal(JSON.stringify([terminals, [...values]]).includes(token), false);
@@ -788,4 +792,42 @@ test('archive reports an unavailable listener without consulting durable correla
     history: { source: 'controller_listener_activity', available: false, complete: false, volatile: true,
       retainedEntries: 0, maxEntries: null, matchedEntries: 0, lostOnRestart: true, evictsOldestUpdated: true, clearedOnGatewayRevocation: true },
   });
+});
+
+
+test('controller discovers current approved targets without leaking trust material', async t => {
+  const value = harness();
+  await value.settings.set('controllerGateways', [
+    {gatewayId:'worker-online', status:'approved'},
+    {gatewayId:'worker-offline', status:'approved'},
+    {gatewayId:'revoked', status:'revoked'},
+    {gatewayId:'untrusted'},
+    {gatewayId:'interrupted', status:'approved'},
+  ]);
+  await value.settings.set('controllerTrustMutations', ['interrupted']);
+  await value.secrets.set('controller.gateway.worker-online', 'do-not-disclose');
+  const service = await createControllerService(value);
+  t.after(() => service.close());
+  const controller = createProcessController(service);
+  assert.deepEqual(await controller.listHosts(), [
+    {id:'worker-offline', name:'worker-offline'},
+    {id:'worker-online', name:'worker-online'},
+  ]);
+  assert.equal(await controller.describeHost('worker-offline'), null);
+  await value.settings.set('controllerGateways', [{gatewayId:'new-approval', status:'approved'}]);
+  assert.deepEqual(await controller.listHosts(), [{id:'new-approval',name:'new-approval'}], 'read current trust, not activation snapshot');
+  await value.settings.set('controllerGateways', []);
+  assert.deepEqual(await controller.listHosts(), []);
+});
+
+test('registered execution provider exposes listHosts and preserves exact advertised targets', async () => {
+  const value = harness(); let controller;
+  const expected = [{id:'worker',name:'Worker'}];
+  const service = {state:()=>({}),listLiveGateways:()=>[],listHosts:async()=>expected,
+    dispatchProcessExec(){},dispatchCancel(){},close(){}};
+  const lifecycle = await activate({...value,controllerService:service,
+    processExecution:{registerController(c){controller=c;return ()=>{};}}});
+  try { assert.deepEqual(await controller.listHosts(), expected); }
+  finally { await lifecycle.close(); }
+  await assert.rejects(createProcessController({dispatchProcessExec(){},dispatchCancel(){}}).listHosts(), /remote_host_listing_unsupported/);
 });

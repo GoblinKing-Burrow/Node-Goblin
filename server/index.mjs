@@ -182,7 +182,7 @@ function safeTelemetryDispatch(value, code) {
 // Keep documented operational categories while discarding arbitrary exception text.
 const SAFE_GATEWAY_DISPATCH_ERRORS = new Set([
   'gateway_not_connected', 'gateway_not_ready', 'gateway_disconnected', 'gateway_dispatch_failed',
-  'operation_id_conflict', 'operation_in_progress', 'protected_redelivery_forbidden',
+  'operation_id_conflict', 'operation_in_progress', 'protected_redelivery_forbidden', 'protected_delivery_binding_invalid',
 ]);
 function safeTelemetryDispatchError(error) {
   const candidate = error?.code || error?.message;
@@ -199,11 +199,9 @@ function serviceError(error) {
 function dispatchError(envelope) {
   const detail = envelope?.error || {};
   const code = SAFE_GATEWAY_DISPATCH_ERRORS.has(detail.code) ? detail.code : 'gateway_dispatch_failed';
-  const error = new Error(code);
-  error.code = code;
-  error.operationId = detail.operationId;
-  error.envelope = { ...envelope, error: { ...detail, code } };
-  return error;
+  // A peer can echo private request data in any property. Only the known code
+  // crosses this error boundary; do not attach the peer response to the Error.
+  return Object.assign(new Error(code), { code });
 }
 
 const OPERATIONS_NAME = 'controllerOperations';
@@ -320,6 +318,10 @@ export function createProcessController(service, { logger = console, operationSt
   if (!service || typeof service.dispatchProcessExec !== 'function' || typeof service.dispatchCancel !== 'function') throw new Error('controller_service_invalid');
   return Object.freeze({
     describeHost: targetId => service.describeHost?.(targetId) ?? null,
+    async listHosts() {
+      if (typeof service.listHosts !== 'function') throw problem('remote_host_listing_unsupported');
+      return service.listHosts();
+    },
     async codexRpc({ targetId, method, params }) {
       const dispatch = await service.dispatchCodex(targetId, method, params);
       if (!dispatch?.response?.ok) throw new Error('codex_transport_failed');
@@ -581,6 +583,15 @@ export async function createControllerService({ settings, secrets, listenerFacto
       });
     },
     describeHost: (gatewayId) => listener?.describeHost?.(gatewayId) ?? null,
+    async listHosts() {
+      // Discover from the same current trust authority used by Settings. A
+      // disconnected approved host remains selectable as unavailable; revoked,
+      // untrusted and interrupted approvals must not be advertised as targets.
+      return (await configuredGatewayIdentities(settings, secrets))
+        .filter(identity => identity.approved)
+        .map(({ gatewayId }) => ({ id: gatewayId, name: gatewayId }))
+        .sort((a, b) => a.id.localeCompare(b.id));
+    },
     listLiveGateways: () => listener ? listener.listLiveGateways() : [],
     listGateways: () => listener
       ? (listener.listGateways?.() ?? listener.listLiveGateways())
