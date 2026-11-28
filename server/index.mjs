@@ -1,3 +1,4 @@
+import { registerDesktopTool } from './desktop-tool.mjs';
 import { boundedPending } from '../gateway/lib/pairing.mjs';
 import { normalizePrivateTelemetryConfiguration } from '../gateway/lib/telemetry-configuration.mjs';
 import { createHash } from 'node:crypto';
@@ -43,7 +44,8 @@ function cleanProcessRequest(value = {}) {
   if (command != null && executable != null) throw problem('command_and_executable_mutually_exclusive');
   if (command == null && executable == null) throw problem('command_or_executable_required');
   if (command != null && args?.length) throw problem('args_with_command_invalid');
-  return command != null ? { command: command.trim() } : { executable: executable.trim(), args: args ? [...args] : [] };
+  if (value.commandShell != null && (command == null || !['powershell', 'cmd'].includes(value.commandShell))) throw problem('command_shell_invalid');
+  return command != null ? { command: command.trim(), ...(value.commandShell != null ? { commandShell: value.commandShell } : {}) } : { executable: executable.trim(), args: args ? [...args] : [] };
 }
 
 function cleanName(value) {
@@ -298,7 +300,7 @@ export function shellExecResult(request, dispatch) {
     signal: evidence.signal ?? null,
     timedOut,
     cancelled,
-    killed: evidence.signal != null,
+    killed: evidence.killed === true || evidence.signal != null,
     durationMs: evidence.durationMs ?? null,
     stdout,
     stderr,
@@ -602,6 +604,10 @@ export async function createControllerService({ settings, secrets, listenerFacto
       if (!listening) throw new Error('controller_not_running');
       return listener.dispatchCodex(gatewayId, method, params);
     },
+    async dispatchDesktop(gatewayId, params) {
+      if (!listening) throw new Error('controller_not_running');
+      return listener.dispatchDesktop(gatewayId, params);
+    },
     async dispatchProcessExec(gatewayId, params) {
       if (!listening) throw Object.assign(new Error(startError || 'controller_not_running'), { code: startError || 'controller_not_running' });
       return redact(await listener.dispatchProcessExec(gatewayId, params), [...secretValues]);
@@ -636,8 +642,9 @@ export async function createControllerService({ settings, secrets, listenerFacto
   });
 }
 
-export async function activate({ api, settings, secrets, logger, processExecution, controllerService, listenerFactory } = {}) {
+export async function activate({ api, settings, secrets, logger, processExecution, controllerService, listenerFactory, tools } = {}) {
   const service = controllerService ?? await createControllerService({ settings, secrets, listenerFactory, logger });
+  registerDesktopTool(tools, service);
   const operationStore = createOperationCorrelationStore(settings);
   const unregisterController = processExecution?.registerController ? processExecution.registerController(Object.freeze({
     ...createProcessController(service, { logger, operationStore }),
